@@ -32,7 +32,7 @@ PGUSER=postgres4
 BACKUP_DIR="$HOME/backups/base"
 DATE=$(date +%Y%m%d_%H%M%S)
 RETENTION_DAYS_LOCAL=7
-REMOTE_HOST="postgres4@reserved_node"
+REMOTE_HOST="postgres4@199"
 REMOTE_BACKUP_DIR="~/backups/base"
 LOG_FILE="$HOME/backup.log"
 
@@ -67,7 +67,7 @@ echo "[$(date)] === ЗАВЕРШЕНИЕ ===" >> $LOG_FILE
 4. **`BACKUP_DIR="$HOME/backups/base"`** — директория на основном узле, куда будут сохраняться бэкапы.
 5. **`DATE=$(date +%Y%m%d_%H%M%S)`** — генерирует строку с текущей датой и временем в формате ГГГГММДД_ЧЧММСС для уникального имени архива.
 6. **`RETENTION_DAYS_LOCAL=7`** — срок хранения бэкапов на основном узле (7 дней).
-7. **`REMOTE_HOST="postgres4@reserved_node"`** — адрес резервного узла (имя пользователя и хост).
+7. **`REMOTE_HOST="postgres4@199"`** — адрес резервного узла (имя пользователя и хост).
 8. **`REMOTE_BACKUP_DIR="~/backups/base"`** — директория на резервном узле для хранения бэкапов.
 9. **`LOG_FILE="$HOME/backup.log"`** — файл журнала, куда записываются события скрипта.
 10. **`echo "[$(date)] === НАЧАЛО БЭКАПА ===" >> $LOG_FILE`** — записывает в лог-файл отметку о начале операции.
@@ -222,84 +222,62 @@ S(13) = 14.3 ГБ
 
 Теперь представим, что был потерян основной узел. Требуется сделать восстановление на резервном узле.
 
-Выполняем подключение. Проверим, установлен ли там PostgreSQL. Инструкция ниже
+Подключаемся к узлу резервному
 
 ```
 # Подключиться к резервному узлу
-ssh -J s335189@helios.cs.ifmo.ru:2222 postgres4@reserved_node
-
-# Проверить, установлен ли PostgreSQL
-psql --version
-# или
-which psql
-
-# Проверить статус PostgreSQL
-sudo systemctl status postgresql
+ssh -J s335189@helios.cs.ifmo.ru:2222 postgres4@199
 ```
-
-Если PostgreSQL не установлен, то установим его
-```
-
-sudo apt update
-sudo apt install postgresql-16 postgresql-client-16
-```
-
-Но мы пока не запускаем его. А если он был запущен, то необходимо его остановить
-```
-sudo systemctl stop postgresql
-```
-
-Ну а теперь ищем самый последний бэкап. Переходим к директории, в которую мы сохраняем. У меня это `~/backups/base/`
-
-С помощью `ls -la` смотрим бэкапы. У меня шаблон названия такой: `base_backup_*.tar.gz`. Запомним имя последнего. Можно использовать такую команду
-```
-LATEST=$(ls -t base_backup_*.tar.gz | head -1)
-```
-Вот все действия данного шага:
-```
-
-cd ~/backups/base/
-
-
-ls -la base_backup_*.tar.gz
-
-
-LATEST=$(ls -t base_backup_*.tar.gz | head -1)
-echo $LATEST
-```
-
-Начнем восстанавливать данные
+Останавливаем все лишнее на всякий случай
 
 ```
+pg_ctl -D ~/restore_data stop 2>/dev/null
+pkill postgres 2>/dev/null
+rm -rf ~/restore_data
+rm -rf /var/db/postgres4/tablespace_16392
+```
 
-# Создать директорию для восстановленных данных
+Ище последний бэкап
+
+```
+cd ~/backups/base
+LATEST=$(ls -td base_backup_* | head -1)
+echo "Бэкап: $LATEST"
+```
+
+Копируем его и распаковываем
+
+```
 mkdir -p ~/restore_data
-
-# Распаковать бэкап
-tar -xzf $LATEST -C ~/restore_data
+cp -r $LATEST/* ~/restore_data/
+cd ~/restore_data
+tar -xzf base.tar.gz
 ```
 
-Изменим в конфигурации порт на 9777. Это поясняется тем, что согласно прошлой лабораторной работе я должен был основной узел делать на порту 9776. И чтобы резервный не конфликтовал с основным, запустим его на порту 9777.
+Делаем табличное пространство 16392
+```
+mkdir -p /var/db/postgres4/tablespace_16392
+chmod 0700 /var/db/postgres4/tablespace_16392
+tar -xzf 16392.tar.gz -C /var/db/postgres4/tablespace_16392/
+```
 
+Создаем ссылку 
 ```
-echo "port = 9777" >> ~/restore_data/postgresql.conf
+rm -f pg_tblspc/16392
+ln -s /var/db/postgres4/tablespace_16392 pg_tblspc/16392
 ```
 
-Ну а дальше запустим сервер
+Теперь уже настраиваем порт и запускаем
 ```
+echo "port = 9777" >> postgresql.conf
+chmod 0700 ~/restore_data
 pg_ctl -D ~/restore_data start
 ```
-И выполним маленький скрипт для проверки базы
 
+Порт 9777 выбран, чтоб не конфликтовать с основным узло на порту 9776
+
+Ну а теперь делаем запуск
 ```
-# Подключиться к восстановленной БД (порт 9777)
-psql -h localhost -p 9777 -U postgres4 -d postgres
-
-# Проверить наличие баз
-\l
-
-# Проверить данные в goodpinklab
-\c goodpinklab
-SELECT COUNT(*) FROM test_data;
-SELECT * FROM test_data LIMIT 5;
+psql -h localhost -p 9777 -U postgres4 -d postgres -c "SELECT 1;"
+psql -h localhost -p 9777 -U postgres4 -d goodpinklab -c "SELECT COUNT(*) FROM test_data;"
 ```
