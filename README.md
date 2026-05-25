@@ -222,13 +222,13 @@ S(13) = 14.3 ГБ
 
 Теперь представим, что был потерян основной узел. Требуется сделать восстановление на резервном узле.
 
-Подключаемся к узлу резервному
+Подключаемся к резервному узлу
 
 ```
 # Подключиться к резервному узлу
 ssh -J s335189@helios.cs.ifmo.ru:2222 postgres4@199
 ```
-Останавливаем все лишнее на всякий случай
+Останавливаем все лишние процессы на всякий случай
 
 ```
 pg_ctl -D ~/restore_data stop 2>/dev/null
@@ -237,7 +237,7 @@ rm -rf ~/restore_data
 rm -rf /var/db/postgres4/tablespace_16392
 ```
 
-Ище последний бэкап
+Ищем последний бэкап
 
 ```
 cd ~/backups/base
@@ -254,7 +254,7 @@ cd ~/restore_data
 tar -xzf base.tar.gz
 ```
 
-Делаем табличное пространство 16392
+Создаем табличное пространство 16392
 ```
 mkdir -p /var/db/postgres4/tablespace_16392
 chmod 0700 /var/db/postgres4/tablespace_16392
@@ -274,10 +274,204 @@ chmod 0700 ~/restore_data
 pg_ctl -D ~/restore_data start
 ```
 
-Порт 9777 выбран, чтоб не конфликтовать с основным узло на порту 9776
+Порт 9777 выбран, чтобы не конфликтовать с основным узлом на порту 9776
 
-Ну а теперь делаем запуск
+Запускаем проверку
 ```
 psql -h localhost -p 9777 -U postgres4 -d postgres -c "SELECT 1;"
 psql -h localhost -p 9777 -U postgres4 -d goodpinklab -c "SELECT COUNT(*) FROM test_data;"
+```
+
+# Этап 3
+
+На данном этапе я должен симулировать сбой на основном узле. Мы теряем данные, но доступ к основному узлу остается.
+
+Для симуляции сбоя выполним следующие шаги.
+
+Проверим табличные пространства
+
+```
+psql -p 9776 -U postgres4 -d postgres -c "SELECT spcname, pg_tablespace_location(oid) FROM pg_tablespace;"
+
+
+psql -p 9776 -U postgres4 -d postgres -c "SELECT datname, dattablespace::regclass FROM pg_database WHERE datname = 'postgres';"
+```
+
+Получил следующий вывод:
+
+```
+ spcname   | pg_tablespace_location
+------------+-------------------------
+ pg_default |
+ pg_global  |
+ dvj53      | /var/db/postgres4/dvj53
+(3 строки)
+
+ datname  | dattablespace
+----------+---------------
+ postgres | 16392
+(1 строка)
+```
+
+Останавливаем сервер
+```
+pg_ctl -D $HOME/tps29 stop
+```
+
+И удаляем табличные пространства
+```
+# Удалить табличное пространство
+rm -rf /var/db/postgres4/dvj53
+
+# Проверить, что удалилось
+ls -la /var/db/postgres4/ | grep dvj53
+```
+
+При запуске СУБД она запустится, но при попытке подключения к БД будет выдавать ошибку. То есть данные будут потеряны.
+
+
+Остановим сервер и найдем последний бэкап
+
+```
+pg_ctl -D $HOME/tps29 stop
+
+
+cd ~/backups/base
+LATEST=$(ls -td base_backup_* | head -1)
+echo "Бэкап: $LATEST"
+```
+
+Теперь стоит создать директорию для восстановленного табличного пространства 
+
+```
+mkdir -p /var/db/postgres4/dvj53_restored
+chmod 700 /var/db/postgres4/dvj53_restored
+```
+
+Восстанавливаем туда данные и распаковываем
+```
+rm -rf /tmp/pg_restore
+mkdir -p /tmp/pg_restore
+cp -r $LATEST/* /tmp/pg_restore/
+cd /tmp/pg_restore
+
+
+tar -xzf base.tar.gz
+
+tar -xzf 16392.tar.gz -C /var/db/postgres4/dvj53_restored/
+```
+
+Обновим символическую ссылку
+
+```
+rm -f $HOME/tps29/pg_tblspc/16392
+ln -s /var/db/postgres4/dvj53_restored $HOME/tps29/pg_tblspc/16392
+```
+Запускаем сервер и проверяем работу БД
+
+```
+pg_ctl -D $HOME/tps29 start
+
+
+psql -p 9776 -U postgres4 -d postgres -c "SELECT 1;"
+psql -p 9776 -U postgres4 -d goodpinklab -c "SELECT COUNT(*) FROM test_data;"
+psql -p 9776 -U postgres4 -d postgres -c "SELECT spcname, pg_tablespace_location(oid) FROM pg_tablespace;"
+```
+
+Получаем вывод
+
+```
+ ?column?
+----------
+        1
+(1 строка)
+
+ count
+-------
+  1000
+(1 строка)
+
+  spcname   |      pg_tablespace_location
+------------+----------------------------------
+ pg_default |
+ pg_global  |
+ dvj53      | /var/db/postgres4/dvj53_restored
+ ```
+
+ 
+# Этап 4
+
+Проверим нормальную работу. Выполним подключение к основному узлу и БД goodpinklab
+
+```
+
+\c goodpinklab
+
+
+SELECT COUNT(*) FROM test_data;
+
+
+INSERT INTO test_data (name, value) VALUES 
+    ('record_before_1', 999),
+    ('record_before_2', 888),
+    ('record_before_3', 777);
+
+
+SELECT COUNT(*) FROM test_data;
+SELECT * FROM test_data ORDER BY id DESC LIMIT 5;
+
+
+SELECT now();
+```
+
+
+Симулируем потерю данных
+```
+
+DELETE FROM test_data WHERE id % 2 = 0;
+
+SELECT COUNT(*) FROM test_data;
+SELECT * FROM test_data ORDER BY id LIMIT 10;
+```
+
+Восстанавливаем через резервный узел. Для этого подключаемся к нему и делаем там дамп
+
+```
+
+ssh postgres4@pg199
+
+
+pg_ctl -D ~/restore_data status
+
+
+pg_dump -h localhost -p 9777 -U postgres4 -d goodpinklab > ~/goodpinklab_dump.sql
+
+# Проверить, что дамп создался
+ls -la ~/goodpinklab_dump.sql
+head -20 ~/goodpinklab_dump.sql
+```
+
+Копируем данные на основной узел
+```
+
+scp ~/goodpinklab_dump.sql postgres4@pg198:~/
+```
+
+Подключаемся к основному узлу и удаляем старую схему
+```
+psql -p 9776 -U postgres4 -d goodpinklab -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+```
+
+Восстанавливаем из дампа
+```
+psql -p 9776 -U postgres4 -d goodpinklab < ~/goodpinklab_dump.sql
+```
+
+Проверяем
+```
+[postgres4@pg198 ~]$ psql -p 9776 -U postgres4 -d goodpinklab -c "SELECT COUNT(*) FROM test_data;"
+ count
+-------
+  1000
+(1 строка)
 ```
